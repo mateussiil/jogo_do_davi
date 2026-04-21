@@ -1,6 +1,6 @@
 # Sprite Animation Specification
 
-_Status: **In Progress**_
+_Status: **Implemented** (com ajustes de bugs)_
 
 ## Problem Statement
 
@@ -13,14 +13,17 @@ The game currently renders characters as colored rectangles. The pipo-nekonin sp
 - Frame size: 32×32px
 - Layout: 3 columns × 4 rows = 12 frames per file
 
-## Animation Row Mapping
+## Animation Row Mapping (implementado)
 
-| Row | Frames | Animation | Use in platformer |
-|-----|--------|-----------|-------------------|
-| 0   | 0,1,2  | idle      | standing still    |
-| 1   | 3,4,5  | walk_left | moving left       |
-| 2   | 6,7,8  | walk_right| moving right      |
-| 3   | 9,10,11| jump      | airborne          |
+| Row | Animation | Frames | FPS | start_col |
+|-----|-----------|--------|-----|-----------|
+| 1   | idle_left  | 1      | 1   | 1 (frame central) |
+| 2   | idle_right | 1      | 1   | 1 (frame central) |
+| 1   | walk_left  | 3      | 8   | 0 |
+| 2   | walk_right | 3      | 8   | 0 |
+| 2   | jump       | 1      | 1   | 1 |
+
+> **Nota:** `idle_left`/`idle_right` foram necessários pois `idle` único usava row 1 (walk_left), fazendo o personagem olhar sempre para esquerda ao parar.
 
 ## Character → Sprite File Mapping
 
@@ -43,27 +46,28 @@ The game currently renders characters as colored rectangles. The pipo-nekonin sp
 
 ## User Stories
 
-### P1: SpriteSheet loader ⭐ MVP
+### P1: SpriteSheet loader ⭐ MVP — IMPLEMENTED
 
 **Acceptance Criteria**:
-1. WHEN SpriteSheet loaded with a path THEN it SHALL slice frames via (col * FRAME_W, row * FRAME_H)
-2. WHEN get_frame(row, col) called THEN SHALL return a pygame.Surface of the correct frame
-3. SHALL support horizontal flip for mirroring
+1. WHEN SpriteSheet loaded with a path THEN it SHALL slice frames via (col * FRAME_W, row * FRAME_H) ✅
+2. WHEN get_frame(row, col) called THEN SHALL return a pygame.Surface of the correct frame ✅
+3. Cache de sheets por path para evitar recarregamentos ✅
 
-### P1: AnimatedSprite component ⭐ MVP
-
-**Acceptance Criteria**:
-1. WHEN update(dt) called THEN frame index SHALL advance based on fps
-2. WHEN animation changes THEN frame index SHALL reset to 0
-3. WHEN draw called THEN current frame SHALL blit at the player's screen position, centered
-
-### P1: Per-character animation state ⭐ MVP
+### P1: AnimatedSprite component ⭐ MVP — IMPLEMENTED
 
 **Acceptance Criteria**:
-1. WHEN vx == 0 AND on_ground THEN animation SHALL be "idle"
-2. WHEN vx < 0 THEN animation SHALL be "walk_left"
-3. WHEN vx > 0 THEN animation SHALL be "walk_right"
-4. WHEN NOT on_ground THEN animation SHALL be "jump"
+1. WHEN update(dt) called THEN frame index SHALL advance based on fps ✅
+2. WHEN animation changes THEN frame index SHALL reset to 0 ✅
+3. WHEN draw called THEN current frame SHALL blit escalado ao rect do personagem ✅
+
+### P1: Per-character animation state ⭐ MVP — IMPLEMENTED
+
+**Acceptance Criteria**:
+1. WHEN vx == 0 AND on_ground AND facing == 1 THEN animation SHALL be "idle_right" ✅
+2. WHEN vx == 0 AND on_ground AND facing == -1 THEN animation SHALL be "idle_left" ✅
+3. WHEN vx < 0 THEN animation SHALL be "walk_left" ✅
+4. WHEN vx > 0 THEN animation SHALL be "walk_right" ✅
+5. WHEN NOT on_ground THEN animation SHALL be "jump" ✅
 
 ---
 
@@ -71,6 +75,6 @@ The game currently renders characters as colored rectangles. The pipo-nekonin sp
 
 | Req ID | Story | Status |
 |--------|-------|--------|
-| SPRITE-01 | SpriteSheet loader | Implementing |
-| SPRITE-02 | AnimatedSprite component | Implementing |
-| SPRITE-03 | Per-character animation state | Implementing |
+| SPRITE-01 | SpriteSheet loader | Verified |
+| SPRITE-02 | AnimatedSprite component | Verified |
+| SPRITE-03 | Per-character animation state | Verified |

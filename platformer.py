@@ -12,68 +12,73 @@ Controls:
   ESC             - Quit
 """
 
-import pygame
-import sys
-import os
+importafrom constants import (
+    WIDTH, HEIGHT, FPS, LEVEL_WIDTH,
+    SKY, BLACK, DARK_GRAY, GRAY, BROWN, BREAK_COL,
+    C_WARRIOR, C_MAGE, C_DRUID, C_ROGUE,
+)
+from player import Warrior, Mage, Druid, Rogue
+from enemy import GreenWarrior, GreenMelee, Ghost, SpikeBall, Boss
+from menu import MainMenu, PauseMenu
+
+SAVE_PATH = os.path.join(os.path.dirname(__file__), "save.json")
 
 pygame.init()
 
-# ==============================================================================
-# Sprite animation
-# ==============================================================================
-
-FRAME_W = 32
-FRAME_H = 32
-
-ANIMATIONS = {
-    #                 row  frames  fps  start_col
-    "idle":       {"row": 1, "frames": 1, "fps": 1,  "start_col": 1},  # middle frame of walk row
-    "walk_left":  {"row": 1, "frames": 3, "fps": 8,  "start_col": 0},
-    "walk_right": {"row": 2, "frames": 3, "fps": 8,  "start_col": 0},
-    "jump":       {"row": 2, "frames": 1, "fps": 1,  "start_col": 1},  # middle frame, static
-}
-
-_sprite_cache = {}
-
-def _load_sheet(path):
-    if path not in _sprite_cache:
-        sheet = pygame.image.load(path).convert_alpha()
-        _sprite_cache[path] = sheet
-    return _sprite_cache[path]
-
-def get_frame(sheet, row, col):
-    frame = pygame.Surface((FRAME_W, FRAME_H), pygame.SRCALPHA)
-    frame.blit(sheet, (0, 0), (col * FRAME_W, row * FRAME_H, FRAME_W, FRAME_H))
-    return frame
 
 # ==============================================================================
-# Constants
+# Tile rendering helpers
 # ==============================================================================
 
-WIDTH       = 800
-HEIGHT      = 600
-FPS         = 60
-GRAVITY     = 900       # pixels per second squared
-LEVEL_WIDTH = 2200      # total horizontal level extent
+_TILE_DIR    = os.path.join(os.path.dirname(__file__), "sprites", "enemy", "tileset", "1 Tiles")
+_tile_raw    = {}   # filename → Surface (32×32 original)
+_tile_scaled = {}   # (filename, w, h) → Surface
 
-# ==============================================================================
-# Colours
-# ==============================================================================
+def _get_tile(name, w, h):
+    if name not in _tile_raw:
+        _tile_raw[name] = pygame.image.load(
+            os.path.join(_TILE_DIR, name)).convert_alpha()
+    key = (name, w, h)
+    if key not in _tile_scaled:
+        _tile_scaled[key] = pygame.transform.scale(_tile_raw[name], (w, h))
+    return _tile_scaled[key]
 
-SKY       = (135, 206, 235)
-BLACK     = (  0,   0,   0)
-DARK_GRAY = ( 50,  50,  50)
-GRAY      = (110, 110, 110)
-BROWN     = (101,  67,  33)
-BREAK_COL = (180, 100,  30)
+def _tile_row(surface, name, tile_w, tile_h, row_x, row_y, total_w):
+    """Blit a tile repeatedly to fill total_w pixels horizontally."""
+    t = _get_tile(name, tile_w, tile_h)
+    x = row_x
+    while x < row_x + total_w:
+        clip = min(tile_w, row_x + total_w - x)
+        surface.blit(t, (x, row_y), (0, 0, clip, tile_h))
+        x += tile_w
 
-# Character colours
-C_WARRIOR = (220,  40,  40)   # red
-C_MAGE    = (148,   0, 211)   # purple
-C_DRUID   = ( 34, 139,  34)   # green
-C_ROGUE   = (255, 140,   0)   # orange
+def _draw_ground_tiles(surface, rx, ry, rw, rh):
+    """Tile_01/02/03 top strip + Tile_04 fill for ground platforms."""
+    ts   = 16   # tile size for this context
+    top  = min(ts, rh)
+    fill = rh - top
 
-C_PROJ    = (  0, 230, 230)   # cyan projectile
+    _get_tile("Tile_01.png", ts, top)   # warm cache
+    surface.blit(_get_tile("Tile_01.png", ts, top), (rx, ry))
+    _tile_row(surface, "Tile_02.png", ts, top, rx + ts, ry, rw - 2 * ts)
+    surface.blit(_get_tile("Tile_03.png", ts, top), (rx + rw - ts, ry))
+
+    if fill > 0:
+        fy = ry + top
+        while fy < ry + rh:
+            fh = min(ts, ry + rh - fy)
+            _tile_row(surface, "Tile_04.png", ts, fh, rx, fy, rw)
+            fy += ts
+
+def _draw_platform_tiles(surface, rx, ry, rw, rh):
+    """Tile_07/08/09 for thin floating platforms."""
+    ts = rh   # scale tile to platform height so it fits exactly
+    if rw <= ts:
+        _tile_row(surface, "Tile_08.png", rw, rh, rx, ry, rw)
+        return
+    surface.blit(_get_tile("Tile_07.png", ts, rh), (rx, ry))
+    _tile_row(surface, "Tile_08.png", ts, rh, rx + ts, ry, rw - 2 * ts)
+    surface.blit(_get_tile("Tile_09.png", ts, rh), (rx + rw - ts, ry))
 
 
 # ==============================================================================
@@ -89,10 +94,49 @@ class Platform:
         self.breakable = False
 
     def draw(self, surface, cam_x):
-        r = pygame.Rect(self.rect.x - cam_x, self.rect.y,
-                        self.rect.w, self.rect.h)
-        pygame.draw.rect(surface, self.color, r)
-        pygame.draw.rect(surface, DARK_GRAY, r, 2)
+        rx = self.rect.x - cam_x
+        ry = self.rect.y
+        rw = self.rect.w
+        rh = self.rect.h
+        if rh > 20:
+            _draw_ground_tiles(surface, rx, ry, rw, rh)
+        else:
+            _draw_platform_tiles(surface, rx, ry, rw, rh)
+
+
+class Checkpoint:
+    """Flag post that updates the player's respawn point on contact."""
+
+    W, H      = 14, 48
+    COLOR_OFF = (180, 180,  40)   # yellow — not yet reached
+    COLOR_ON  = ( 40, 210,  80)   # green  — activated
+
+    def __init__(self, x, y):
+        # x,y = ground level; post rises upward
+        self.rect    = pygame.Rect(x, y - self.H, self.W, self.H)
+        self.active  = False
+        self.spawn_x = x + self.W // 2
+        self.spawn_y = y
+
+    def try_activate(self, player_rect):
+        if not self.active and self.rect.colliderect(player_rect):
+            self.active = True
+            return True
+        return False
+
+    def draw(self, surface, cam_x):
+        rx = self.rect.x - cam_x
+        ry = self.rect.y
+        # pole
+        pygame.draw.rect(surface, (120, 80, 40), (rx + 5, ry, 4, self.H))
+        # flag
+        flag_color = self.COLOR_ON if self.active else self.COLOR_OFF
+        pts = [
+            (rx + 9,  ry + 4),
+            (rx + 26, ry + 12),
+            (rx + 9,  ry + 20),
+        ]
+        pygame.draw.polygon(surface, flag_color, pts)
 
 
 class BreakableBlock(Platform):
@@ -110,390 +154,9 @@ class BreakableBlock(Platform):
                         self.rect.w, self.rect.h)
         pygame.draw.rect(surface, self.color, r)
         pygame.draw.rect(surface, (90, 45, 0), r, 2)
-        # Cross marker signals "breakable"
         cx, cy = r.centerx, r.centery
         pygame.draw.line(surface, (90, 45, 0), (cx - 8, cy - 8), (cx + 8, cy + 8), 2)
         pygame.draw.line(surface, (90, 45, 0), (cx + 8, cy - 8), (cx - 8, cy + 8), 2)
-
-
-# ==============================================================================
-# Projectile
-# ==============================================================================
-
-class Projectile:
-    """Simple circle projectile fired by the Mage."""
-
-    def __init__(self, x, y, direction, speed=420, radius=7):
-        self.x      = float(x)
-        self.y      = float(y)
-        self.vx     = speed * direction
-        self.radius = radius
-        self.active = True
-
-    def update(self, dt):
-        self.x += self.vx * dt
-        if self.x < -200 or self.x > LEVEL_WIDTH + 200:
-            self.active = False
-
-    def draw(self, surface, cam_x):
-        if self.active:
-            pygame.draw.circle(surface, C_PROJ,
-                               (int(self.x - cam_x), int(self.y)), self.radius)
-
-
-# ==============================================================================
-# AnimatedSprite
-# ==============================================================================
-
-class AnimatedSprite:
-    """Handles frame timing and drawing for a single spritesheet."""
-
-    def __init__(self, sheet_path):
-        self._sheet    = _load_sheet(sheet_path)
-        self._anim     = "idle"
-        self._col      = 0
-        self._timer    = 0.0
-
-    def set_animation(self, name):
-        if name != self._anim:
-            self._anim  = name
-            self._col   = 0
-            self._timer = 0.0
-
-    def update(self, dt):
-        anim = ANIMATIONS[self._anim]
-        self._timer += dt
-        if self._timer >= 1.0 / anim["fps"]:
-            self._timer = 0.0
-            self._col   = (self._col + 1) % anim["frames"]
-
-    def draw(self, surface, dest_rect, cam_x):
-        anim  = ANIMATIONS[self._anim]
-        frame = get_frame(self._sheet, anim["row"], self._col)
-        # Scale frame to the player's bounding box and center it
-        scaled = pygame.transform.scale(frame, (dest_rect.w, dest_rect.h))
-        surface.blit(scaled, (dest_rect.x - cam_x, dest_rect.y))
-
-
-# ==============================================================================
-# Player base
-# ==============================================================================
-
-class Player:
-    """
-    Base player. Subclasses override class-level stats and use_ability().
-    Physics: AABB collision against Platforms, constant GRAVITY downward.
-    """
-
-    NAME        = "Player"
-    COLOR       = (200, 200, 200)
-    WIDTH       = 30
-    HEIGHT      = 40
-    SPEED       = 200
-    JUMP_FORCE  = -480       # negative = upward
-    MAX_JUMPS   = 1
-    SPRITE_FILE = None       # set in subclasses
-
-    _SPRITES_DIR = os.path.join(os.path.dirname(__file__), "sprites", "character")
-
-    def __init__(self, x, y):
-        self.rect        = pygame.Rect(x, y, self.WIDTH, self.HEIGHT)
-        self.vx          = 0.0
-        self.vy          = 0.0
-        self.on_ground   = False
-        self.jumps_left  = self.MAX_JUMPS
-        self.facing      = 1           # 1 = right, -1 = left
-        self.projectiles = []
-
-        if self.SPRITE_FILE:
-            path = os.path.join(self._SPRITES_DIR, self.SPRITE_FILE)
-            self._sprite = AnimatedSprite(path)
-        else:
-            self._sprite = None
-
-    # --------------------------------------------------------------------------
-    # Input
-    # --------------------------------------------------------------------------
-
-    def handle_input(self, keys, events):
-        """Standard horizontal movement and jump."""
-        self.vx = 0.0
-        if keys[pygame.K_LEFT] or keys[pygame.K_a]:
-            self.vx = -self.SPEED
-            self.facing = -1
-        if keys[pygame.K_RIGHT] or keys[pygame.K_d]:
-            self.vx = self.SPEED
-            self.facing = 1
-
-        for event in events:
-            if event.type == pygame.KEYDOWN:
-                if event.key in (pygame.K_UP, pygame.K_w):
-                    if self.jumps_left > 0:
-                        self.vy = self.JUMP_FORCE
-                        self.jumps_left -= 1
-
-    def use_ability(self, events, platforms):
-        """Override in subclasses to add special moves."""
-        pass
-
-    # --------------------------------------------------------------------------
-    # Physics
-    # --------------------------------------------------------------------------
-
-    def update(self, dt, platforms):
-        # Apply gravity
-        self.vy += GRAVITY * dt
-
-        # Horizontal movement then collision
-        self.rect.x += int(self.vx * dt)
-        self._resolve_h(platforms)
-
-        # Vertical movement then collision
-        self.rect.y += int(self.vy * dt)
-        self.on_ground = False
-        self._resolve_v(platforms)
-
-        # Replenish jumps on landing
-        if self.on_ground:
-            self.jumps_left = self.MAX_JUMPS
-
-        # Hard left wall
-        if self.rect.left < 0:
-            self.rect.left = 0
-
-        # Update and prune projectiles
-        self.projectiles = [p for p in self.projectiles if p.active]
-        for p in self.projectiles:
-            p.update(dt)
-
-        # Sprite animation state
-        if self._sprite:
-            if not self.on_ground:
-                anim = "jump"
-            elif self.vx < 0:
-                anim = "walk_left"
-            elif self.vx > 0:
-                anim = "walk_right"
-            else:
-                anim = "idle"
-            self._sprite.set_animation(anim)
-            self._sprite.update(dt)
-
-    def _iter_solid(self, platforms):
-        """Yield platforms that are currently solid (skips broken blocks)."""
-        for plat in platforms:
-            if isinstance(plat, BreakableBlock) and plat.broken:
-                continue
-            yield plat
-
-    def _resolve_h(self, platforms):
-        for plat in self._iter_solid(platforms):
-            if self.rect.colliderect(plat.rect):
-                if self.vx > 0:
-                    self.rect.right = plat.rect.left
-                elif self.vx < 0:
-                    self.rect.left  = plat.rect.right
-                self.vx = 0.0
-
-    def _resolve_v(self, platforms):
-        for plat in self._iter_solid(platforms):
-            if self.rect.colliderect(plat.rect):
-                if self.vy > 0:
-                    self.rect.bottom = plat.rect.top
-                    self.on_ground   = True
-                    self.vy          = 0.0
-                elif self.vy < 0:
-                    self.rect.top = plat.rect.bottom
-                    self.vy       = 0.0
-
-    # --------------------------------------------------------------------------
-    # Draw
-    # --------------------------------------------------------------------------
-
-    def draw(self, surface, cam_x):
-        if self._sprite:
-            self._sprite.draw(surface, self.rect, cam_x)
-        else:
-            r = pygame.Rect(self.rect.x - cam_x, self.rect.y,
-                            self.rect.w, self.rect.h)
-            pygame.draw.rect(surface, self.COLOR, r)
-            pygame.draw.rect(surface, BLACK, r, 2)
-
-            eye_y = r.top + max(6, r.h // 5)
-            eye_x = (r.right - 8) if self.facing == 1 else (r.left + 8)
-            pygame.draw.circle(surface, BLACK, (eye_x, eye_y), 3)
-
-        # Draw own projectiles
-        for p in self.projectiles:
-            p.draw(surface, cam_x)
-
-
-# ==============================================================================
-# Character subclasses
-# ==============================================================================
-
-class Warrior(Player):
-    """
-    Tank fighter.
-    - Slow speed, low jump.
-    - SPACE: smash the breakable block directly in front.
-    """
-
-    NAME        = "Warrior"
-    COLOR       = C_WARRIOR
-    WIDTH       = 36
-    HEIGHT      = 50
-    SPEED       = 140
-    JUMP_FORCE  = -370
-    MAX_JUMPS   = 1
-    SPRITE_FILE = "pipo-nekonin001.png"
-
-    def __init__(self, x, y):
-        super().__init__(x, y)
-        self._break_cd = 0.0       # cooldown between smashes
-
-    def update(self, dt, platforms):
-        super().update(dt, platforms)
-        self._break_cd = max(0.0, self._break_cd - dt)
-
-    def use_ability(self, events, platforms):
-        for event in events:
-            if event.type == pygame.KEYDOWN and event.key == pygame.K_SPACE:
-                if self._break_cd <= 0:
-                    self._smash(platforms)
-
-    def _smash(self, platforms):
-        """Destroy the nearest breakable block directly ahead."""
-        probe = pygame.Rect(
-            self.rect.x + self.facing * self.rect.w,
-            self.rect.y,
-            self.rect.w,
-            self.rect.h,
-        )
-        for plat in platforms:
-            if isinstance(plat, BreakableBlock) and not plat.broken:
-                if probe.colliderect(plat.rect):
-                    plat.broken    = True
-                    self._break_cd = 0.5
-                    break
-
-
-class Mage(Player):
-    """
-    Balanced caster.
-    - Medium speed and jump.
-    - SPACE: shoot a cyan projectile forward.
-    """
-
-    NAME        = "Mage"
-    COLOR       = C_MAGE
-    WIDTH       = 28
-    HEIGHT      = 38
-    SPEED       = 200
-    JUMP_FORCE  = -480
-    MAX_JUMPS   = 1
-    SPRITE_FILE = "pipo-nekonin005.png"
-
-    def __init__(self, x, y):
-        super().__init__(x, y)
-        self._shoot_cd = 0.0
-
-    def update(self, dt, platforms):
-        super().update(dt, platforms)
-        self._shoot_cd = max(0.0, self._shoot_cd - dt)
-
-    def use_ability(self, events, platforms):
-        for event in events:
-            if event.type == pygame.KEYDOWN and event.key == pygame.K_SPACE:
-                if self._shoot_cd <= 0:
-                    offset_x = self.facing * (self.WIDTH // 2 + 6)
-                    self.projectiles.append(
-                        Projectile(
-                            self.rect.centerx + offset_x,
-                            self.rect.centery,
-                            self.facing,
-                        )
-                    )
-                    self._shoot_cd = 0.3
-
-
-class Druid(Player):
-    """
-    Nature jumper.
-    - Slightly slower movement.
-    - High jump force + double-jump (passive: MAX_JUMPS = 2).
-    """
-
-    NAME        = "Druid"
-    COLOR       = C_DRUID
-    WIDTH       = 30
-    HEIGHT      = 42
-    SPEED       = 170
-    JUMP_FORCE  = -630
-    MAX_JUMPS   = 2       # double jump is the passive ability
-    SPRITE_FILE = "pipo-nekonin009.png"
-
-
-class Rogue(Player):
-    """
-    Speedster.
-    - Fastest base movement.
-    - Left SHIFT: dash (brief very-high-speed burst).
-    """
-
-    NAME          = "Rogue"
-    COLOR         = C_ROGUE
-    WIDTH         = 24
-    HEIGHT        = 36
-    SPEED         = 320
-    JUMP_FORCE    = -480
-    MAX_JUMPS     = 1
-    SPRITE_FILE   = "pipo-nekonin013.png"
-
-    DASH_SPEED    = 850
-    DASH_DURATION = 0.18
-    DASH_COOLDOWN = 0.80
-
-    def __init__(self, x, y):
-        super().__init__(x, y)
-        self._dashing    = False
-        self._dash_timer = 0.0
-        self._dash_cd    = 0.0
-        self._dash_dir   = 1
-
-    def update(self, dt, platforms):
-        # Tick dash timers before physics so vx override is applied correctly
-        if self._dashing:
-            self._dash_timer -= dt
-            if self._dash_timer <= 0:
-                self._dashing = False
-        self._dash_cd = max(0.0, self._dash_cd - dt)
-        super().update(dt, platforms)
-
-    def handle_input(self, keys, events):
-        super().handle_input(keys, events)
-        if self._dashing:
-            # Override horizontal velocity with dash speed
-            self.vx = self.DASH_SPEED * self._dash_dir
-
-    def use_ability(self, events, platforms):
-        for event in events:
-            if event.type == pygame.KEYDOWN and event.key == pygame.K_LSHIFT:
-                if not self._dashing and self._dash_cd <= 0:
-                    self._dashing    = True
-                    self._dash_timer = self.DASH_DURATION
-                    self._dash_cd    = self.DASH_COOLDOWN
-                    self._dash_dir   = self.facing
-
-    def draw(self, surface, cam_x):
-        super().draw(surface, cam_x)
-        # Semi-transparent white flash while dashing
-        if self._dashing:
-            r = pygame.Rect(self.rect.x - cam_x, self.rect.y,
-                            self.rect.w, self.rect.h)
-            flash = pygame.Surface((r.w, r.h), pygame.SRCALPHA)
-            flash.fill((255, 255, 255, 90))
-            surface.blit(flash, r.topleft)
 
 
 # ==============================================================================
@@ -501,54 +164,135 @@ class Rogue(Player):
 # ==============================================================================
 
 def create_level():
-    """
-    World layout (not to scale):
-
-      x=0          x=500  gap  x=650                      x=2200
-      [== ground ==]      150px[====== ground continues ========]
-
-    Key sections:
-      - Gap at x 500-650  : 150 px wide, best crossed with Druid's high jump
-      - Breakable wall at x~790 : Warrior smashes through; others must go around
-      - Speed corridor x 900-1300 : open ground, Rogue shines
-      - Tall tower x 1440-1600  : stacked short platforms, needs Druid double-jump
-    """
     platforms = []
 
-    # Ground (split by gap)
-    platforms.append(Platform(   0, 560,  500, 40, BROWN))  # left ground
-    platforms.append(Platform( 650, 560, 1550, 40, BROWN))  # right ground
+    # ------------------------------------------------------------------ Zone 1
+    # Ground (gap at x=325–423)
+    platforms.append(Platform(  0, 540,  325, 30, BROWN))
+    platforms.append(Platform(423, 540, 1127, 30, BROWN))  # x=423-1550
 
-    # Left warm-up platforms
-    platforms.append(Platform( 120, 460,  120, 18))
-    platforms.append(Platform( 300, 390,  100, 18))
-    platforms.append(Platform( 440, 320,  120, 18))         # launch pad above gap
+    # Warm-up platforms
+    platforms.append(Platform( 78, 475,  78, 14))
+    platforms.append(Platform(195, 423,  65, 14))
+    platforms.append(Platform(286, 371,  78, 14))
 
-    # After-gap platforms
-    platforms.append(Platform( 670, 470,  160, 18))
-    platforms.append(Platform( 870, 400,  100, 18))
+    # After-gap
+    platforms.append(Platform(436, 488, 104, 14))
+    platforms.append(Platform(566, 423,  65, 14))
 
-    # Breakable wall (two stacked blocks blocking ground-level path)
-    platforms.append(BreakableBlock(790, 520, 40, 40))
-    platforms.append(BreakableBlock(790, 480, 40, 40))
+    # Breakable wall
+    platforms.append(BreakableBlock(514, 514, 26, 26))
+    platforms.append(BreakableBlock(514, 488, 26, 26))
 
-    # Speed corridor (x 950-1350)
-    platforms.append(Platform( 950, 340,  180, 18))
-    platforms.append(Platform(1160, 270,  160, 18))
-    platforms.append(Platform(1320, 340,  140, 18))
+    # Speed corridor
+    platforms.append(Platform(618, 358, 117, 14))
+    platforms.append(Platform(754, 306, 104, 14))
+    platforms.append(Platform(858, 358,  91, 14))
 
-    # Tall tower (Druid showcase, x 1440-1600)
-    platforms.append(Platform(1440, 480,   80, 18))
-    platforms.append(Platform(1500, 390,   80, 18))
-    platforms.append(Platform(1560, 300,   80, 18))
-    platforms.append(Platform(1560, 210,  140, 18))         # tower summit
+    # Tall tower
+    platforms.append(Platform( 936, 462,  52, 14))
+    platforms.append(Platform( 975, 384,  52, 14))
+    platforms.append(Platform(1014, 306,  52, 14))
+    platforms.append(Platform(1014, 228,  91, 14))
 
-    # Final stretch
-    platforms.append(Platform(1720, 350,  200, 18))
-    platforms.append(Platform(1950, 440,  180, 18))
-    platforms.append(Platform(2080, 360,  100, 18))         # finish platform
+    # Bridge to zone 2
+    platforms.append(Platform(1118, 371, 130, 14))
+    platforms.append(Platform(1235, 449, 117, 14))
+    platforms.append(Platform(1352, 371,  65, 14))
+
+    # ------------------------------------------------------------------ Zone 2
+    # Ponte suspensa — gap at x=1550–1700, stepping stones needed (Druid)
+    platforms.append(Platform(1550, 488,  65, 14))   # ledge before gap
+    platforms.append(Platform(1620, 436,  52, 14))   # stone 1
+    platforms.append(Platform(1680, 371,  52, 14))   # stone 2 (high)
+    platforms.append(Platform(1740, 436,  52, 14))   # stone 3
+    platforms.append(Platform(1800, 540, 400, 30, BROWN))  # ground resumes x=1800
+
+    platforms.append(Platform(1820, 462,  78, 14))
+    platforms.append(Platform(1900, 384,  65, 14))
+    platforms.append(Platform(1970, 306,  78, 14))
+    platforms.append(Platform(2040, 384,  65, 14))
+
+    # ------------------------------------------------------------------ Zone 3
+    # Corredor de blocos — Warrior necessary, 3 breakable walls
+    platforms.append(Platform(2200, 540, 550, 30, BROWN))  # ground x=2200-2750
+
+    platforms.append(BreakableBlock(2260, 514, 26, 26))    # wall 1 (2 tall)
+    platforms.append(BreakableBlock(2260, 488, 26, 26))
+    platforms.append(Platform(2240, 423, 91, 14))          # platform above
+
+    platforms.append(BreakableBlock(2400, 514, 26, 26))    # wall 2 (3 tall)
+    platforms.append(BreakableBlock(2400, 488, 26, 26))
+    platforms.append(BreakableBlock(2400, 462, 26, 26))
+    platforms.append(Platform(2380, 371, 104, 14))
+
+    platforms.append(BreakableBlock(2560, 514, 26, 26))    # wall 3 (2 tall)
+    platforms.append(BreakableBlock(2560, 488, 26, 26))
+    platforms.append(Platform(2540, 436,  78, 14))
+
+    platforms.append(Platform(2650, 358,  91, 14))
+    platforms.append(Platform(2700, 280,  78, 14))         # height challenge
+
+    # ------------------------------------------------------------------ Zone 4
+    # Plataformas no céu — gap at x=2750-2900, no ground (Druid + Rogue)
+    platforms.append(Platform(2750, 462,  65, 14))
+    platforms.append(Platform(2820, 384,  65, 14))
+    platforms.append(Platform(2890, 306,  65, 14))
+    platforms.append(Platform(2960, 228,  78, 14))         # summit
+    platforms.append(Platform(3030, 306,  65, 14))
+    platforms.append(Platform(3080, 384,  65, 14))
+
+    # ------------------------------------------------------------------ Zone 5
+    # Arena do boss — chão amplo para o boss ter espaço de patrulha
+    platforms.append(Platform(2980, 540, 320, 30, BROWN))  # x=2980-3300
+
+    # Torre lateral (acesso visual, não bloqueia o boss)
+    platforms.append(Platform(2990, 462,  52, 14))
+    platforms.append(Platform(3000, 384,  52, 14))
+    platforms.append(Platform(3010, 306,  52, 14))
+    platforms.append(Platform(3010, 228, 120, 14))         # topo da torre
 
     return platforms
+
+
+def create_checkpoints():
+    return [
+        Checkpoint( 430, 540),   # CP1 — início após gap
+        Checkpoint(1560, 540),   # CP2 — ponte suspensa
+        Checkpoint(2210, 540),   # CP3 — corredor de blocos
+        Checkpoint(2760, 462),   # CP4 — plataformas no céu (plataforma flutuante)
+        Checkpoint(2985, 540),   # CP5 — arena do boss
+    ]
+
+
+def create_enemies():
+    return [
+        # Zone 1
+        GreenWarrior(100,  490,   0,  300),
+        Ghost(       460,  435, 423,  560),
+        GreenMelee(  650,  490, 423,  850),
+        SpikeBall(   780,  330, 618,  858),
+        GreenWarrior(1000, 420, 936, 1066),
+        Ghost(       1180, 320,1118, 1365),
+
+        # Zone 2 — ponte suspensa
+        SpikeBall(   1840, 435,1800, 1970),
+        GreenMelee(  1960, 357,1900, 2100),
+
+        # Zone 3 — corredor de blocos
+        GreenWarrior(2300, 490,2200, 2450),
+        SpikeBall(   2480, 357,2380, 2560),
+        GreenMelee(  2620, 490,2550, 2750),
+        Ghost(       2680, 253,2650, 2750),
+
+        # Zone 4 — plataformas no céu
+        Ghost(       2850, 357,2820, 2960),
+        SpikeBall(   2990, 279,2960, 3080),
+
+        # Zone 5 — guardas antes da arena do boss
+        GreenWarrior(3000, 476, 2980, 3080),
+        SpikeBall(   3060, 476, 2980, 3120),
+    ]
 
 
 # ==============================================================================
@@ -558,7 +302,7 @@ def create_level():
 class Camera:
     """Smooth horizontal-scrolling camera; lerps toward the player center."""
 
-    SMOOTH = 8.0    # lerp speed (higher = snappier)
+    SMOOTH = 8.0
 
     def __init__(self):
         self.x = 0.0
@@ -580,7 +324,7 @@ class Camera:
 class Game:
     """Top-level controller: main loop, character roster, camera, HUD."""
 
-    SPAWN = (60, 490)
+    SPAWN = (40, 490)
 
     def __init__(self):
         self.screen  = pygame.display.set_mode((WIDTH, HEIGHT))
@@ -589,34 +333,106 @@ class Game:
         self.font_sm = pygame.font.SysFont("monospace", 16)
         self.font_md = pygame.font.SysFont("monospace", 22, bold=True)
         self.running = True
+        self.state   = "MAIN_MENU"
 
-        self.platforms = create_level()
+        music_path = os.path.join(os.path.dirname(__file__),
+                                   "music", "exploration-chiptune-rpg-adventure-theme.mp3")
+        pygame.mixer.music.load(music_path)
+        pygame.mixer.music.set_volume(0.5)
+        pygame.mixer.music.play(-1)   # -1 = loop infinito
 
-        sx, sy = self.SPAWN
+        bg_path = os.path.join(os.path.dirname(__file__),
+                               "sprites", "enemy", "tileset", "2 Background", "Background.png")
+        raw_bg = pygame.image.load(bg_path).convert()
+        self.background = pygame.transform.scale(raw_bg, (WIDTH, HEIGHT))
+
+        self._init_level()
+
+        self.main_menu  = MainMenu(self.background, os.path.exists(SAVE_PATH))
+        self.pause_menu = PauseMenu()
+
+    # ------------------------------------------------------------------
+    # Level / character initialisation
+    # ------------------------------------------------------------------
+
+    def _init_level(self):
+        self.platforms   = create_level()
+        self.enemies     = create_enemies()
+        self.checkpoints = create_checkpoints()
+        self.spawn       = list(self.SPAWN)   # mutable, updated by checkpoints
+        sx, sy = self.spawn
         self.characters = [
             Warrior(sx, sy),
             Mage   (sx, sy),
             Druid  (sx, sy),
             Rogue  (sx, sy),
         ]
-        self.idx = 0
-
-        self.camera       = Camera()
-        self._tab_held    = False
+        self.idx    = 0
+        self.lives  = 3
+        self.camera = Camera()
+        # Boss spawns on Zone 5 arena (platform top = 540, boss height = 64)
+        self.boss   = Boss(3150, 476, 2995, 3285)
 
     @property
     def player(self):
         return self.characters[self.idx]
 
-    # --------------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Save / Load
+    # ------------------------------------------------------------------
+
+    def save_game(self):
+        p = self.player
+        broken = [
+            [pl.rect.x, pl.rect.y]
+            for pl in self.platforms
+            if getattr(pl, "breakable", False) and pl.broken
+        ]
+        active_cps = [cp.spawn_x for cp in self.checkpoints if cp.active]
+        data = {
+            "player_idx":  self.idx,
+            "position":    [p.rect.centerx, p.rect.bottom],
+            "spawn":       self.spawn,
+            "lives":       self.lives,
+            "broken_blocks": broken,
+            "checkpoints": active_cps,
+        }
+        with open(SAVE_PATH, "w") as f:
+            json.dump(data, f)
+
+    def load_game(self):
+        if not os.path.exists(SAVE_PATH):
+            return
+        with open(SAVE_PATH) as f:
+            data = json.load(f)
+
+        self._init_level()
+        self.idx   = data.get("player_idx", 0)
+        self.spawn = data.get("spawn", list(self.SPAWN))
+        self.lives = data.get("lives", 3)
+        cx, cy     = data.get("position", self.spawn)
+        for ch in self.characters:
+            ch.rect.centerx = cx
+            ch.rect.bottom  = cy
+
+        for bx, by in data.get("broken_blocks", []):
+            for pl in self.platforms:
+                if getattr(pl, "breakable", False) and pl.rect.x == bx and pl.rect.y == by:
+                    pl.broken = True
+
+        active_cps = set(data.get("checkpoints", []))
+        for cp in self.checkpoints:
+            if cp.spawn_x in active_cps:
+                cp.active = True
+
+    # ------------------------------------------------------------------
     # Character switch
-    # --------------------------------------------------------------------------
+    # ------------------------------------------------------------------
 
     def _switch_character(self):
-        """Cycle to the next character, carrying over position and velocity."""
-        old       = self.player
-        self.idx  = (self.idx + 1) % len(self.characters)
-        new       = self.player
+        old      = self.player
+        self.idx = (self.idx + 1) % len(self.characters)
+        new      = self.player
 
         new.rect.centerx = old.rect.centerx
         new.rect.bottom  = old.rect.bottom
@@ -626,89 +442,333 @@ class Game:
         new.jumps_left   = new.MAX_JUMPS if old.on_ground else 0
         new.projectiles  = []
 
-    # --------------------------------------------------------------------------
+    # ------------------------------------------------------------------
     # Main loop
-    # --------------------------------------------------------------------------
+    # ------------------------------------------------------------------
 
     def run(self):
         while self.running:
-            # Cap dt to avoid tunnelling after focus loss
             dt     = min(self.clock.tick(FPS) / 1000.0, 0.05)
             events = pygame.event.get()
 
-            # System events
             for event in events:
                 if event.type == pygame.QUIT:
                     self.running = False
-                elif event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
-                    self.running = False
 
-            keys = pygame.key.get_pressed()
-
-            # TAB: switch character (debounced)
-            if keys[pygame.K_TAB]:
-                if not self._tab_held:
-                    self._switch_character()
-                self._tab_held = True
-            else:
-                self._tab_held = False
-
-            # Update active player
-            p = self.player
-            p.use_ability(events, self.platforms)   # abilities before movement
-            p.handle_input(keys, events)
-            p.update(dt, self.platforms)
-
-            # Camera follows player
-            self.camera.update(p.rect, dt)
-
-            # Respawn if fell off screen
-            if p.rect.top > HEIGHT + 80:
-                p.rect.topleft = self.SPAWN
-                p.vx = p.vy = 0.0
-
-            self._draw()
+            if self.state == "MAIN_MENU":
+                self._run_main_menu(events)
+            elif self.state == "PLAYING":
+                self._run_playing(events, dt)
+            elif self.state == "PAUSED":
+                self._run_paused(events, dt)
 
         pygame.quit()
         sys.exit()
 
-    # --------------------------------------------------------------------------
-    # Drawing
-    # --------------------------------------------------------------------------
+    # ------------------------------------------------------------------
 
-    def _draw(self):
-        self.screen.fill(SKY)
+    def _run_main_menu(self, events):
+        self.main_menu.handle_events(events)
+        if self.main_menu.choice == "new":
+            self._init_level()
+            self.state = "PLAYING"
+        elif self.main_menu.choice == "load":
+            self.load_game()
+            self.state = "PLAYING"
+        self.main_menu.choice = None
+        self.main_menu.draw(self.screen)
+
+    def _run_playing(self, events, dt):
+        for event in events:
+            if event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_ESCAPE:
+                    self.pause_menu._sel    = 0
+                    self.pause_menu.choice  = None
+                    self.state = "PAUSED"
+                    return
+                elif event.key == pygame.K_TAB:
+                    self._switch_character()
+
+        keys = pygame.key.get_pressed()
+        p    = self.player
+        p.use_ability(events, self.platforms)
+        p.handle_input(keys, events)
+        p.update(dt, self.platforms)
+
+        for cp in self.checkpoints:
+            if cp.try_activate(p.rect):
+                self.spawn = [cp.spawn_x, cp.spawn_y]
+
+        # Spider strike — area of effect
+        if getattr(p, 'spider_strike_active', False):
+            scx, scy = p.spider_center
+            r = p.SPIDER_RADIUS
+            for enemy in self.enemies:
+                if enemy.alive:
+                    import math
+                    dx = enemy.rect.centerx - scx
+                    dy = enemy.rect.centery - scy
+                    if math.hypot(dx, dy) <= r:
+                        enemy.kill()
+
+        atk_rect = p.attack_rect
+        for proj in p.projectiles:
+            proj_rect = pygame.Rect(int(proj.x) - proj.radius, int(proj.y) - proj.radius,
+                                    proj.radius * 2, proj.radius * 2)
+            for enemy in self.enemies:
+                if enemy.alive and proj_rect.colliderect(enemy.rect):
+                    enemy.kill()
+                    proj.active = False
+            if self.boss.alive and proj_rect.colliderect(self.boss.rect):
+                self.boss.damage()
+                proj.active = False
+
+        for enemy in self.enemies:
+            enemy.update(dt, self.platforms)
+            if not enemy.alive:
+                continue
+            if atk_rect and atk_rect.colliderect(enemy.rect):
+                enemy.kill()
+            elif enemy.collides_with_player(p.rect):
+                self._lose_life()
+                return
+
+        # Boss update + combat
+        self.boss.update(dt, self.platforms, p.rect)
+        if self.boss.alive:
+            if atk_rect and atk_rect.colliderect(self.boss.rect):
+                self.boss.damage()
+            if getattr(p, 'spider_strike_active', False):
+                scx, scy = p.spider_center
+                import math as _math
+                dx = self.boss.rect.centerx - scx
+                dy = self.boss.rect.centery - scy
+                if _math.hypot(dx, dy) <= p.SPIDER_RADIUS:
+                    self.boss.damage()
+            # Stomp shockwave hurts player
+            if self.boss.stomp_active:
+                import math as _math2
+                scx, scy = self.boss.stomp_center
+                dx = p.rect.centerx - scx
+                dy = p.rect.centery - scy
+                if _math2.hypot(dx, dy) <= self.boss.STOMP_RADIUS:
+                    self._lose_life()
+                    return
+            # Charge / contact hurts player
+            if self.boss.alive and self.boss.rect.colliderect(p.rect):
+                self._lose_life()
+                return
+        if not self.boss.alive and self.boss.hp <= 0:
+            self._draw_victory()
+            return
+
+        self.camera.update(p.rect, dt)
+
+        if p.rect.top > HEIGHT + 80:
+            self._lose_life()
+            return
+
+        self._draw_game()
+
+    def _lose_life(self):
+        self.lives -= 1
+        p = self.player
+        if self.lives <= 0:
+            self._draw_game_over()
+        else:
+            p.rect.centerx, p.rect.bottom = self.spawn
+            p.vx = p.vy = 0.0
+
+    def _draw_game_over(self):
+        font_lg = pygame.font.SysFont("monospace", 52, bold=True)
+        font_sm = pygame.font.SysFont("monospace", 22)
+        overlay = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+        overlay.fill((0, 0, 0, 180))
+        self.screen.blit(overlay, (0, 0))
+        t = font_lg.render("GAME OVER", True, (220, 40, 40))
+        s = font_sm.render("Pressione ENTER para o menu principal", True, (200, 200, 200))
+        self.screen.blit(t, ((WIDTH - t.get_width()) // 2, HEIGHT // 2 - 50))
+        self.screen.blit(s, ((WIDTH - s.get_width()) // 2, HEIGHT // 2 + 20))
+        pygame.display.flip()
+        # Wait for ENTER
+        while True:
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    pygame.quit(); sys.exit()
+                if event.type == pygame.KEYDOWN and event.key == pygame.K_RETURN:
+                    self._init_level()
+                    self.main_menu._sel   = 0
+                    self.main_menu.choice = None
+                    self.state = "MAIN_MENU"
+                    return
+
+    def _run_paused(self, events, dt):
+        self.pause_menu.handle_events(events)
+        choice = self.pause_menu.choice
+
+        if choice == "resume":
+            self.state = "PLAYING"
+            self.pause_menu.choice = None
+        elif choice == "save":
+            self.save_game()
+            self.pause_menu.show_message("Jogo salvo!")
+            self.pause_menu.choice = None
+            self.main_menu.has_save = True
+        elif choice == "main_menu":
+            self.main_menu.has_save = os.path.exists(SAVE_PATH)
+            self.main_menu.choice   = None
+            self.main_menu._sel     = 0
+            self.state = "MAIN_MENU"
+            self.pause_menu.choice  = None
+
+        self._draw_game()
+        self.pause_menu.draw(self.screen, dt)
+
+    # ------------------------------------------------------------------
+    # Drawing
+    # ------------------------------------------------------------------
+
+    def _draw_boss_hud(self):
+        bar_w  = 300
+        bar_h  = 14
+        bx     = (WIDTH - bar_w) // 2
+        by     = 10
+        ratio  = self.boss.hp / self.boss.MAX_HP
+
+        # Background
+        panel = pygame.Surface((bar_w + 20, bar_h + 22), pygame.SRCALPHA)
+        panel.fill((10, 10, 10, 190))
+        self.screen.blit(panel, (bx - 10, by - 4))
+
+        label = self.font_sm.render("CHEFE FINAL", True, (255, 80, 80))
+        self.screen.blit(label, (bx + (bar_w - label.get_width()) // 2, by))
+
+        by2 = by + 14
+        pygame.draw.rect(self.screen, (60,  0,  0),  (bx, by2, bar_w, bar_h))
+        fill_w = int(bar_w * ratio)
+        if fill_w > 0:
+            # Gradient: dark red → bright red based on remaining HP
+            r_col = (180 + int(75 * ratio), 20, 20)
+            pygame.draw.rect(self.screen, r_col, (bx, by2, fill_w, bar_h))
+        pygame.draw.rect(self.screen, (255, 80, 80), (bx, by2, bar_w, bar_h), 1)
+
+        # HP pips
+        pip_w = bar_w // self.boss.MAX_HP - 2
+        for i in range(self.boss.MAX_HP):
+            px = bx + i * (bar_w // self.boss.MAX_HP)
+            pygame.draw.line(self.screen, (10, 10, 10),
+                             (px, by2), (px, by2 + bar_h), 1)
+
+    def _draw_victory(self):
+        font_lg = pygame.font.SysFont("monospace", 54, bold=True)
+        font_md = pygame.font.SysFont("monospace", 24)
+        overlay = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+        overlay.fill((0, 0, 0, 200))
+        self.screen.blit(overlay, (0, 0))
+        t1 = font_lg.render("VITÓRIA!", True, (255, 215, 0))
+        t2 = font_md.render("Você derrotou o Chefe Final!", True, (220, 220, 220))
+        t3 = font_md.render("Pressione ENTER para o menu principal", True, (160, 160, 160))
+        self.screen.blit(t1, ((WIDTH - t1.get_width()) // 2, HEIGHT // 2 - 80))
+        self.screen.blit(t2, ((WIDTH - t2.get_width()) // 2, HEIGHT // 2 + 10))
+        self.screen.blit(t3, ((WIDTH - t3.get_width()) // 2, HEIGHT // 2 + 50))
+        pygame.display.flip()
+        while True:
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    pygame.quit(); sys.exit()
+                if event.type == pygame.KEYDOWN and event.key == pygame.K_RETURN:
+                    self._init_level()
+                    self.main_menu._sel   = 0
+                    self.main_menu.choice = None
+                    self.state = "MAIN_MENU"
+                    return
+
+    def _draw_cooldown_bars(self, player):
+        bars      = getattr(player, 'cooldown_bars', [])
+        bar_w     = 90
+        bar_h     = 8
+        label_h   = 13
+        slot_w    = bar_w + 16
+        slot_h    = label_h + bar_h + 10
+        padding   = 10
+        total_w   = len(bars) * slot_w + (len(bars) - 1) * 6
+        base_x    = (WIDTH - total_w) // 2
+        base_y    = HEIGHT - 58
+
+        font = pygame.font.SysFont("monospace", 11, bold=True)
+
+        for i, (key, name, cd, max_cd) in enumerate(bars):
+            x = base_x + i * (slot_w + 6)
+            y = base_y
+
+            # Background panel
+            panel = pygame.Surface((slot_w, slot_h), pygame.SRCALPHA)
+            panel.fill((10, 10, 10, 180))
+            self.screen.blit(panel, (x, y))
+
+            # Key + name label
+            label = font.render(f"[{key}] {name}", True, (180, 180, 180))
+            self.screen.blit(label, (x + (slot_w - label.get_width()) // 2, y + 3))
+
+            # Bar background
+            bx, by = x + 4, y + label_h + 5
+            pygame.draw.rect(self.screen, (40, 40, 40), (bx, by, bar_w, bar_h))
+
+            # Bar fill — ratio 1.0 = ready, 0.0 = just used
+            ratio = 1.0 - (cd / max_cd) if max_cd > 0 else 1.0
+            fill  = int(bar_w * ratio)
+            if fill > 0:
+                if ratio >= 1.0:
+                    color = (212, 175, 55)    # gold — ready
+                else:
+                    r = int(100 + 112 * ratio)
+                    color = (r, int(80 * ratio), 10)   # dark orange → gold
+                pygame.draw.rect(self.screen, color, (bx, by, fill, bar_h))
+
+            # Border
+            pygame.draw.rect(self.screen, (80, 80, 80), (bx, by, bar_w, bar_h), 1)
+
+    def _draw_game(self):
+        self.screen.blit(self.background, (0, 0))
         cam_x = self.camera.int_x
 
-        # Level
         for plat in self.platforms:
             plat.draw(self.screen, cam_x)
 
-        # Active character
-        self.player.draw(self.screen, cam_x)
+        for cp in self.checkpoints:
+            cp.draw(self.screen, cam_x)
 
-        # HUD ----------------------------------------------------------------
+        for enemy in self.enemies:
+            enemy.draw(self.screen, cam_x)
+
+        self.boss.draw(self.screen, cam_x)
+        self.player.draw(self.screen, cam_x)
 
         p = self.player
 
-        # Character name (top-left)
         name_surf = self.font_md.render("[ " + p.NAME + " ]", True, BLACK)
         self.screen.blit(name_surf, (10, 10))
 
-        # Ability hint (below name)
+        # Lives — red hearts
+        for i in range(3):
+            color = (210, 30, 30) if i < self.lives else (60, 60, 60)
+            hx = 10 + i * 22
+            pygame.draw.circle(self.screen, color, (hx + 5,  56), 6)
+            pygame.draw.circle(self.screen, color, (hx + 15, 56), 6)
+            pts = [(hx, 59), (hx + 10, 70), (hx + 20, 59)]
+            pygame.draw.polygon(self.screen, color, pts)
+
         hints = {
-            "Warrior": "SPACE - Break block",
-            "Mage":    "SPACE - Shoot",
-            "Druid":   "W/Up twice - Double jump (passive)",
-            "Rogue":   "L-SHIFT - Dash",
+            "Guerreiro": "SPACE - Quebrar bloco   T - Golpe de aranha",
+            "Mago":      "SPACE - Lançar projétil",
+            "Druida":    "W/Cima duas vezes - Duplo salto (passivo)",
+            "Ladino":    "L-SHIFT - Dash",
         }
-        hint = hints.get(p.NAME, "")
-        hint_surf = self.font_sm.render(hint, True, DARK_GRAY)
+        hint_surf = self.font_sm.render(hints.get(p.NAME, ""), True, DARK_GRAY)
         self.screen.blit(hint_surf, (10, 38))
 
-        # Character selector dots (top-right)
         dot_colors = [C_WARRIOR, C_MAGE, C_DRUID, C_ROGUE]
-        dot_labels = ["W", "M", "Dr", "Ro"]
+        dot_labels = ["Gu", "Ma", "Dr", "La"]
         for i, (col, lbl) in enumerate(zip(dot_colors, dot_labels)):
             dx = WIDTH - 160 + i * 38
             dy = 14
@@ -718,12 +778,18 @@ class Game:
             ls = self.font_sm.render(lbl, True, BLACK)
             self.screen.blit(ls, (dx - ls.get_width() // 2, dy + 14))
 
-        # Bottom bar (controls reminder)
-        ctrl = "A/D - Move   W/Up - Jump   TAB - Switch char   ESC - Quit"
-        ctrl_surf = self.font_sm.render(ctrl, True, DARK_GRAY)
+        self._draw_cooldown_bars(p)
+
+        # Boss HP bar — shown at top-center when boss is alive
+        if self.boss.alive:
+            self._draw_boss_hud()
+
+        ctrl_surf = self.font_sm.render(
+            "A/D - Mover   W - Pular   J - Atacar   TAB - Trocar   ESC - Pause",
+            True, DARK_GRAY,
+        )
         self.screen.blit(ctrl_surf, (10, HEIGHT - 24))
 
-        # FPS (bottom-right)
         fps_surf = self.font_sm.render("FPS " + str(int(self.clock.get_fps())), True, DARK_GRAY)
         self.screen.blit(fps_surf, (WIDTH - 70, HEIGHT - 24))
 
@@ -732,7 +798,8 @@ class Game:
 
 # ==============================================================================
 # Entry point
-# ==============================================================================
+# ====================
+#==========================================================
 
 if __name__ == "__main__":
     Game().run()

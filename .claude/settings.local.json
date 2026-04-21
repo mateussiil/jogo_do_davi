@@ -6,7 +6,8 @@
       "Bash(mkdir -p \"/c/Users/jessi/Documents/development/game/.specs/project\")",
       "Bash(mkdir -p \"/c/Users/jessi/Documents/development/game/.specs/features/core-platformer\")",
       "Bash(python3 -c ' *)",
-      "Bash(python -m py_compile platformer.py)"
+      "Bash(python -m py_compile platformer.py)",
+      "Bash(python -c \"import platformer\")"
     ]
   }
 }
